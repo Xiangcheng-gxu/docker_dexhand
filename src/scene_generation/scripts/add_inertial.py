@@ -30,71 +30,63 @@ def calculate_inertial_properties(stl_path):
     使用更可靠的方法计算惯性属性
     """
     try:
-        # 加载STL文件并进行处理
+        # 加载STL文件
         mesh = trimesh.load(stl_path)
+
+        # 强制使用凸包进行计算，这对于非水密网格更稳健
+        mesh = mesh.convex_hull
         
-        # 确保网格是水密的（watertight）
-        if not mesh.is_watertight:
-            print(f"警告: {stl_path} 不是水密网格，尝试修复...")
-            # 尝试修复网格
-            mesh.fill_holes()
-            mesh.process(validate=True)
-            
-            # 如果仍然不是水密的，使用凸包近似
-            if not mesh.is_watertight:
-                print(f"无法修复 {stl_path}，使用凸包近似")
-                mesh = mesh.convex_hull
-        
-        # 计算体积（立方米）
-        volume = mesh.volume
-        
-        # 检查体积是否合理
-        if volume < 1e-10:  # 非常小的体积
-            print(f"警告: {stl_path} 的体积非常小 ({volume:.6e})，使用边界框估算")
-            # 使用边界框估算体积
+        # 确保网格有体积
+        if mesh.volume < 1e-9:
+            print(f"警告: {stl_path} 的凸包体积过小 ({mesh.volume:.3e})。将使用边界框近似。")
+            # 使用边界框估算
             bounds = mesh.bounds
             size = bounds[1] - bounds[0]
-            volume = size[0] * size[1] * size[2]
+            # 避免尺寸为零
+            size = np.maximum(size, 1e-6)
+            mesh.volume = size[0] * size[1] * size[2]
+            # 对于边界框，质心就是中心
+            mesh.center_mass = mesh.bounds.mean(axis=0)
+            # 重新创建一个基于边界框的trimesh对象以计算惯性
+            mesh = trimesh.creation.box(extents=size, transform=trimesh.transformations.translation_matrix(mesh.center_mass))
+
+        # 假设一个更合理的平均密度，例如 800 kg/m^3
+        # YCB物体密度各不相同，这是一个折衷值
+        density = 800.0
+        mesh.density = density
         
-        # 假设密度为1000 kg/m³（类似水的密度）
-        density = 1000.0
-        mass = density * volume
-        
-        # 获取质心（在网格坐标系中）
+        # 从trimesh获取惯性属性
+        mass = mesh.mass
         centroid = mesh.center_mass
-        
-        # 计算惯性张量（关于质心）
         inertia_tensor = mesh.moment_inertia
-        
-        # 检查惯性张量是否全为零
-        if np.allclose(inertia_tensor, 0, atol=1e-10):
-            print(f"警告: {stl_path} 的惯性张量全为零，使用近似计算")
-            # 使用边界框估算惯性张量
+
+        # 关键修复：检查惯性张量的对角线元素是否过小
+        # 如果惯性张量接近于零，则基于边界框进行估算
+        min_inertia = 1e-7
+        if np.any(np.diag(inertia_tensor) < min_inertia) or np.allclose(inertia_tensor, 0):
+            print(f"警告: {stl_path} 计算出的惯性张量过小或为零，使用边界框近似。")
             bounds = mesh.bounds
             size = bounds[1] - bounds[0]
+            size = np.maximum(size, 1e-6) # 避免尺寸为零
             
-            # 确保尺寸不为零
-            if any(dim < 1e-6 for dim in size):
-                print(f"警告: {stl_path} 的尺寸过小，使用默认惯性张量")
-                # 使用默认惯性张量
-                inertia_tensor = np.diag([0.1, 0.1, 0.1])
-            else:
-                # 对于长方体，惯性张量的近似计算
-                # Ixx = (m/12) * (h^2 + d^2), 其中h和d是垂直于x轴的尺寸
-                ixx = (mass / 12) * (size[1]**2 + size[2]**2)
-                iyy = (mass / 12) * (size[0]**2 + size[2]**2)
-                izz = (mass / 12) * (size[0]**2 + size[1]**2)
-                
-                inertia_tensor = np.array([[ixx, 0, 0],
-                                           [0, iyy, 0],
-                                           [0, 0, izz]])
-        
+            # 对于长方体，惯性张量的近似计算
+            ixx = (mass / 12) * (size[1]**2 + size[2]**2)
+            iyy = (mass / 12) * (size[0]**2 + size[2]**2)
+            izz = (mass / 12) * (size[0]**2 + size[1]**2)
+            
+            # 确保对角线元素不小于最小值
+            ixx = max(ixx, min_inertia)
+            iyy = max(iyy, min_inertia)
+            izz = max(izz, min_inertia)
+
+            inertia_tensor = np.diag([ixx, iyy, izz])
+
         return mass, centroid, inertia_tensor
     except Exception as e:
         print(f"计算惯性属性时出错: {e}")
         # 返回合理的默认值
         print(f"使用默认惯性属性 for {stl_path}")
-        return 1.0, [0.0, 0.0, 0.0], np.diag([0.1, 0.1, 0.1])
+        return 0.1, [0.0, 0.0, 0.0], np.diag([1e-3, 1e-3, 1e-3])
 
 def add_inertial_to_urdf(urdf_path, stl_path):
     """
@@ -206,7 +198,7 @@ if __name__ == "__main__":
     datasets = ['contactdb', 'egadb', 'graspdb', 'ycb']
     
     for dataset_name in datasets:
-        dataset_path = f'/home/user/workspace/src/scene_generation/object copy 2/{dataset_name}'  
+        dataset_path = f'/home/user/workspace/src/scene_generation/object/{dataset_name}'  
         if os.path.exists(dataset_path):
             print(f"处理 {dataset_name} 数据集...")
             process_ycb_dataset(dataset_path)
